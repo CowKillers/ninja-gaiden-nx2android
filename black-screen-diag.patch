@@ -1,0 +1,265 @@
+Temporary black-screen diagnostics for the nx2android Android host (v0.1.2).
+Off by default; enabled only by DM_VK_DIAG=1 in env.txt. Observes only:
+no change to rendering, sync, pacing, swapchain choice or alpha_fix.
+Apply from the nx2android directory (the one containing nxnative/):
+    patch -p1 < black-screen-diag.patch
+See BLACK_SCREEN_DIAGNOSTICS.md for what each new log line means and
+for the A/B/C capture points. Revert to remove (no new build files).
+
+--- a/nxnative/dm/android/gfx_vk.h
++++ b/nxnative/dm/android/gfx_vk.h
+@@ -118,6 +118,8 @@
+ void vk_end_pass_land(void);   // vk_end_pass, then the deferred uniform updates land (before copies, dispatches, the submission's end)
+ void vk_img_barrier_all(VkCommandBuffer cb);   // version 1: one global memory barrier (all images stay in GENERAL)
+ void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im);   // first use: transition from UNDEFINED to GENERAL (and upload a packaged texture)
++int vk_diag_on(void);   // DM_VK_DIAG (temporary black-screen diagnostics, gfx_vk_present.c)
++int vk_present_refs(const vkimg_t *im);   // queued + last-frame references to an image (gfx_vk_present.c)
+ 
+ // ---- shaders (gfx_vk_shader.c) ----
+ enum { RK_SUPPORT, RK_CBUF, RK_C1, RK_DRV, RK_SBUF, RK_UBO_PTR, RK_SBUF_UBO, RK_TEX, RK_TBUF, RK_IMG, RK_IMG_TBUF, RK_TEX_C2A, RK_TEX_UBO, RK_TBUF_UBO, RK_IMG_UBO, RK_UNKNOWN = 255 };
+--- a/nxnative/dm/android/gfx_vk_present.c
++++ b/nxnative/dm/android/gfx_vk_present.c
+@@ -34,15 +34,16 @@
+ __attribute__((weak)) void dm_overlay_menu_xy(float *x, float *y) { *x = *y = 0; for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU) { *x = OV_CTLS[i].x; *y = OV_CTLS[i].y; } }
+ __attribute__((weak)) int dm_text_entry(char *title, int tcap, char *text, int xcap, int *sel, int *shift) { (void)title; (void)tcap; (void)text; (void)xcap; (void)sel; (void)shift; return 0; }
+ static void pace_reset(void);
+-static void swap_destroy(void) {
++static void swap_destroy(const char *why) {
+     pace_reset();
++    if (g_swap || g_surf) VKLOG("swapchain destroyed (%s)", why ? why : "?");
+     if (g_swap) { vkDeviceWaitIdle(V.dev); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
+                   vkDestroySwapchainKHR(V.dev, g_swap, NULL); g_swap = VK_NULL_HANDLE; }
+     if (g_surf) { vkDestroySurfaceKHR(V.inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; }
+ }
+ static int swap_make(void) {
+     ANativeWindow *w = dm_front_window();
+-    if (w != g_win) { swap_destroy(); g_win = w; }
++    if (w != g_win) { swap_destroy("window changed"); g_win = w; }
+     if (!w) return 0;
+     if (g_swap) return 1;
+     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, w};
+@@ -64,7 +65,7 @@
+         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, trans,
+         alpha, VK_PRESENT_MODE_FIFO_KHR, 1, VK_NULL_HANDLE};
+     VkResult r = vkCreateSwapchainKHR(V.dev, &ci, NULL, &g_swap);
+-    if (r) { VKLOG("[RED] swapchain creation failed: %d", r); swap_destroy(); return 0; }
++    if (r) { VKLOG("[RED] swapchain creation failed: %d", r); swap_destroy("swapchain creation failed"); return 0; }
+     g_nsimg = 8; vkGetSwapchainImagesKHR(V.dev, g_swap, &g_nsimg, g_simg);
+     for (uint32_t i = 0; i < g_nsimg; i++) { VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_simg[i], VK_IMAGE_VIEW_TYPE_2D, g_sfmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+         VKCHK(vkCreateImageView(V.dev, &vi, NULL, &g_sview[i])); }
+@@ -482,14 +483,80 @@
+     g_pace_target = t;
+     return t - g_refresh_ns / 2;
+ }
+-static void present_window(vkimg_t *im, const int crop[4], double period) {   // period: the game's frame period (s); < 0 for a redraw of the last frame (no time)
++
++// ---- temporary black-screen diagnostics (DM_VK_DIAG; see BLACK_SCREEN_DIAGNOSTICS.md) ----
++// Off unless DM_VK_DIAG=1 in env.txt. Only observes: no rendering, sync or pacing change.
++static int g_diag = -1, g_diag_every = 60; static long g_diag_left = -1, g_diag_sample = 0;
++int vk_diag_on(void) {
++    if (g_diag < 0) { const char *e = getenv("DM_VK_DIAG"); g_diag = e && atoi(e) ? 1 : 0;
++        const char *ev = getenv("DM_VK_DIAG_EVERY"); if (ev && atoi(ev) > 0) g_diag_every = atoi(ev);
++        const char *sm = getenv("DM_VK_DIAG_SAMPLE"); if (sm && atol(sm) > 0) g_diag_sample = atol(sm); }
++    return g_diag;
++}
++static int diag_capture_armed(uint64_t n) {
++    if (!vk_diag_on()) return 0;
++    if (g_diag_left < 0) { const char *e = getenv("DM_VK_DIAG_FRAMES"); g_diag_left = e ? atol(e) : 0; }
++    if (g_diag_left > 0) return 1;
++    return g_diag_sample > 0 && n > 0 && (long)(n % (uint64_t)g_diag_sample) == 0;
++}
++static void diag_capture_consume(void) { if (g_diag_left > 0) g_diag_left--; }
++static uint64_t diag_hash_rgb(const uint8_t *p, uint32_t w, uint32_t h, int bgra) {
++    uint64_t x = 1469598103934665603ull;
++    for (uint32_t y = 0; y < h; y++) { const uint8_t *s = p + (size_t)y * w * 4;
++        for (uint32_t xx = 0; xx < w; xx++) { x ^= s[4 * xx + (bgra ? 2 : 0)]; x *= 1099511628211ull; x ^= s[4 * xx + 1]; x *= 1099511628211ull; x ^= s[4 * xx + (bgra ? 0 : 2)]; x *= 1099511628211ull; } }
++    return x;
++}
++// B/C staging: one host-visible buffer per present slot and point, allocated on
++// first armed use. Read back only when the slot is reused, after its fence wait,
++// so the GPU is never read while it may still be writing. ~10 MB per slot/point
++// at 2340x1080; PPM files only with DM_VK_DIAG_PPM=1, otherwise only the hash.
++static VkBuffer g_dbuf[8][2]; static VkDeviceMemory g_dmem[8][2]; static void *g_dmap[8][2]; static VkExtent2D g_dext[8][2]; static uint64_t g_dframe[8][2]; static int g_dpend[8][2];
++static int diag_copy_to(VkCommandBuffer cb, uint32_t idx, uint32_t k, int which, uint64_t n, int back) {
++    if (!g_dbuf[k][which] || g_dext[k][which].width != g_sext.width || g_dext[k][which].height != g_sext.height) {
++        if (g_dbuf[k][which]) { vkDestroyBuffer(V.dev, g_dbuf[k][which], NULL); vkFreeMemory(V.dev, g_dmem[k][which], NULL); g_dbuf[k][which] = VK_NULL_HANDLE; g_dmap[k][which] = NULL; }
++        VkBufferCreateInfo bc = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)g_sext.width * g_sext.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
++        if (vkCreateBuffer(V.dev, &bc, NULL, &g_dbuf[k][which])) return 0;
++        VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, g_dbuf[k][which], &rq);
++        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
++        if (vkAllocateMemory(V.dev, &ai, NULL, &g_dmem[k][which])) { vkDestroyBuffer(V.dev, g_dbuf[k][which], NULL); g_dbuf[k][which] = VK_NULL_HANDLE; return 0; }
++        vkBindImageMemory(V.dev, g_dbuf[k][which], g_dmem[k][which], 0);
++        if (vkMapMemory(V.dev, g_dmem[k][which], 0, VK_WHOLE_SIZE, 0, &g_dmap[k][which])) { g_dmap[k][which] = NULL; return 0; }
++        g_dext[k][which] = g_sext;
++    }
++    barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {g_sext.width, g_sext.height, 1}};
++    vkCmdCopyImageToBuffer(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_dbuf[k][which], 1, &c);
++    if (back) barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    g_dframe[k][which] = n; g_dpend[k][which] = 1;
++    return 1;
++}
++static void diag_flush(uint32_t k) {
++    for (int which = 0; which < 2; which++) {
++        if (!g_dpend[k][which] || !g_dmap[k][which]) continue;
++        g_dpend[k][which] = 0;
++        int bgra = g_sfmt == VK_FORMAT_B8G8R8A8_UNORM || g_sfmt == VK_FORMAT_B8G8R8A8_SRGB;
++        uint64_t h = diag_hash_rgb((const uint8_t *)g_dmap[k][which], g_dext[k][which].width, g_dext[k][which].height, bgra);
++        VKLOG("[diag] present %llu %s rgb-hash=%016llx", (unsigned long long)g_dframe[k][which], which ? "C" : "B", (unsigned long long)h);
++        const char *ppm = getenv("DM_VK_DIAG_PPM");
++        if (ppm && atoi(ppm)) { const char *dir = getenv("DM_ROOT"); if (!dir) dir = ".";
++            char path[1024]; snprintf(path, sizeof path, "%s/diag_%s_%06llu.ppm", dir, which ? "C" : "B", (unsigned long long)g_dframe[k][which]);
++            FILE *f = fopen(path, "wb");
++            if (f) { uint32_t w = g_dext[k][which].width, hh = g_dext[k][which].height; const uint8_t *p = (const uint8_t *)g_dmap[k][which];
++                fprintf(f, "P6\n%u %u\n255\n", w, hh);
++                uint8_t *row = malloc((size_t)w * 3);
++                if (row) { for (uint32_t y = 0; y < hh; y++) { const uint8_t *s = p + (size_t)y * w * 4; for (uint32_t x = 0; x < w; x++) { row[3*x] = s[4*x + (bgra ? 2 : 0)]; row[3*x+1] = s[4*x+1]; row[3*x+2] = s[4*x + (bgra ? 0 : 2)]; } fwrite(row, 1, (size_t)w * 3, f); } free(row); }
++                fclose(f); } }
++    }
++}
++static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t n) {   // period: the game's frame period (s); < 0 for a redraw of the last frame (no time); n: present number (0 = redraw)
+     uint32_t k = g_pi++ % 8;
+     struct timespec ta, tb, tc;
+     clock_gettime(CLOCK_MONOTONIC, &ta);
+     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
++    diag_flush(k);   // the slot's previous present is done: its B/C staging is safe to read now
+     uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
+     clock_gettime(CLOCK_MONOTONIC, &tb);
+-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
++    if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy("acquire out of date"); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
+     if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
+     vkResetFences(V.dev, 1, &g_pfence[k]);
+     VkCommandBuffer cb = g_pcb[k];
+@@ -514,14 +581,29 @@
+         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_af.pipe);
+         vkCmdDraw(cb, 3, 1, 0, 0);
+     }
++    int diag_b = n > 0 && diag_capture_armed(n);
++    if (diag_b) {   // point B: swapchain after blit + alpha_fix, before the overlay
++        vkCmdEndRendering(cb);
++        diag_copy_to(cb, idx, k, 0, n, 1);
++        vkCmdBeginRendering(cb, &ri);
++        vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
++    }
+     int ovm = dm_overlay_visible(), menu = dm_menu_state(), fps = dm_overlay_fps();
+     if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu)) {
+         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe);
+         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.layout, 0, 1, &g_ov.set, 0, NULL);
+         ov_render(cb, ovm, menu, fps);
+     }
+-    vkCmdEndRendering(cb);
+-    barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    int diag_c = n > 0 && diag_capture_armed(n);
++    if (diag_c) {   // point C: swapchain after the overlay, before present
++        vkCmdEndRendering(cb);
++        if (diag_copy_to(cb, idx, k, 1, n, 0)) barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++        else barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    } else {
++        vkCmdEndRendering(cb);
++        barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    }
++    if (diag_b || diag_c) diag_capture_consume();
+     vkEndCommandBuffer(cb);
+     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
+@@ -538,7 +620,7 @@
+     double ms_acq = (tb.tv_sec - ta.tv_sec) * 1e3 + (tb.tv_nsec - ta.tv_nsec) / 1e6;
+     double ms_pres = (tc.tv_sec - tb.tv_sec) * 1e3 + (tc.tv_nsec - tb.tv_nsec) / 1e6;
+     static int pcnt; if (pcnt++ % 120 == 0) VKLOG("[present_window] acq_fence=%.2f ms, submit_pres=%.2f ms", ms_acq, ms_pres);
+-    if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
++    if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy("present out of date");
+ }
+ // headless frame shots
+ static int shot_wanted(uint64_t n) {
+@@ -559,6 +641,7 @@
+     VkBufferImageCopy c = {so, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+     vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
+     mtl_wait(mtl_sub_commit(), ~0ull);
++    if (vk_diag_on()) { int bgra = im->fmt == VK_FORMAT_B8G8R8A8_UNORM || im->fmt == VK_FORMAT_B8G8R8A8_SRGB; VKLOG("[diag] A present %llu rgb-hash=%016llx (%ux%u)", (unsigned long long)n, (unsigned long long)diag_hash_rgb(p, w, h, bgra), w, h); }
+     const char *dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = getenv("DM_ROOT"); if (!dir) dir = ".";
+     char path[1024]; snprintf(path, sizeof path, "%s/frame_%06llu.ppm", dir, (unsigned long long)n);
+     FILE *f = fopen(path, "wb");
+@@ -571,7 +654,7 @@
+     VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, w, h);
+ }
+ static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
+-void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
++void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy("window lost"); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
+ // The present thread: mtl_present only queues the frame and returns (as on Apple), so the game thread never waits in vkAcquireNextImageKHR or on the
+ // swapchain's fences (a FIFO swapchain blocks there until a vsync); the window texture is not drawn again before its blit, because NVN's acquire waits for
+ // its ticket (mtl_present_wait), and the blit's submission comes after the frame's own on the one queue. DM_VK_SYNC_PRESENT=1 presents on the game thread.
+@@ -579,6 +662,13 @@
+ static struct { vkimg_t *im; int crop[4], has_crop; uint64_t n; double period; } g_pq[PQ_N];
+ static uint64_t g_pq_head, g_pq_tail, g_pq_done;   // queued [tail, head), presents up to ticket g_pq_done are blitted
+ static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
++static typeof(g_pq[0]) g_present_last;   // mirror of the present thread's last frame, for vk_present_refs (best-effort: read under g_pq_mu)
++int vk_present_refs(const vkimg_t *im) {
++    int n = 0; pthread_mutex_lock(&g_pq_mu);
++    for (uint64_t i = g_pq_tail; i < g_pq_head; i++) if (g_pq[i % PQ_N].im == im) n++;
++    if (g_present_last.im == im) n++;
++    pthread_mutex_unlock(&g_pq_mu); return n;
++}
+ // While the game is held (the pause menu) no frame comes: dm_overlay_redraw presents the last one again with what the overlay now shows.
+ static _Atomic int g_redraw;
+ void dm_overlay_redraw(void) { atomic_store(&g_redraw, 1); pthread_mutex_lock(&g_pq_mu); pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); }
+@@ -591,12 +681,12 @@
+         atomic_store(&g_redraw, 0);
+         if (g_pq_tail == g_pq_head) {   // a redraw, no new frame
+             pthread_mutex_unlock(&g_pq_mu);
+-            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(last.im, last.has_crop ? last.crop : NULL, -1); pthread_mutex_unlock(&g_present_mu); }
++            if (last.im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(last.im, last.has_crop ? last.crop : NULL, -1, 0); pthread_mutex_unlock(&g_present_mu); }
+             continue;
+         }
+         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
+         pthread_mutex_unlock(&g_pq_mu);
+-        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period); pthread_mutex_unlock(&g_present_mu); }
++        if (e.im) { last = e; pthread_mutex_lock(&g_pq_mu); g_present_last = e; pthread_mutex_unlock(&g_pq_mu); pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); else if (vk_diag_on()) VKLOG("[diag] present %llu dropped: no swapchain", (unsigned long long)e.n); pthread_mutex_unlock(&g_present_mu); }
+         pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+     }
+     return NULL;
+@@ -606,7 +696,7 @@
+     static int sync = -1; static pthread_once_t once = PTHREAD_ONCE_INIT;
+     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
+     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
+-        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period); pthread_mutex_unlock(&g_present_mu); }
++        if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period, n); pthread_mutex_unlock(&g_present_mu); }
+         pthread_mutex_lock(&g_pq_mu); if (g_pq_tail == g_pq_head) g_pq_done = n; pthread_mutex_unlock(&g_pq_mu);   // done at once (after any queued ones)
+         return n;
+     }
+@@ -647,6 +737,8 @@
+     if (!im) { no_img++; return present_enqueue(NULL, NULL, n, period); }
+     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) { undrawn++; return present_enqueue(NULL, NULL, n, period); }   // never drawn into: nothing to show yet
+     shown++; atomic_fetch_add(&g_fps_frames, 1);
++    if (vk_diag_on() && (int)(n % (uint64_t)g_diag_every) == 0) { pthread_mutex_lock(&g_pq_mu); uint64_t depth = g_pq_head - g_pq_tail; pthread_mutex_unlock(&g_pq_mu);
++        VKLOG("[diag] present %llu tex %llu %ux%u layout %d crop %d,%d %dx%d queue_depth %llu shown %llu no_img %llu undrawn %llu", (unsigned long long)n, (unsigned long long)t->serial, im->w, im->h, (int)im->layout, crop ? crop[0] : 0, crop ? crop[1] : 0, crop ? crop[2] : (int)im->w, crop ? crop[3] : (int)im->h, (unsigned long long)depth, (unsigned long long)shown, (unsigned long long)no_img, (unsigned long long)undrawn); }
+     if (shot_wanted(n)) shot(im, n);
+     { void vk_pass_dump_poll(uint64_t done); uint64_t vk_fence_done(void); vk_pass_dump_poll(vk_fence_done()); void vk_pass_frame(void); vk_pass_frame(); void vk_tex_sweep(void); vk_tex_sweep(); }
+     if (n % 1800 == 0) {   // every ~30 s: the pipeline cache to disk on a thread of its own (an Android app can be killed without any exit path)
+@@ -659,8 +751,14 @@
+     if (!tk) return;
+     pthread_mutex_lock(&g_pq_mu);
+     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 1;
++    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+     while (g_pq_done < tk && pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &dl) == 0) {}
++    int timeout = g_pq_done < tk; uint64_t done = g_pq_done;
++    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
++    double ms_wait = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+     pthread_mutex_unlock(&g_pq_mu);
++    if (timeout) { static int n; if (n++ < 20) VKLOG("[diag] mtl_present_wait TIMEOUT after 1 s: ticket %llu, done %llu (game redraws a texture still queued for blit)", (unsigned long long)tk, (unsigned long long)done); }
++    else if (vk_diag_on() && ms_wait > 100) VKLOG("[diag] mtl_present_wait slow: %.1f ms for ticket %llu", ms_wait, (unsigned long long)tk);
+ }
+ double mtl_presented_time(uint64_t n) { return n && n <= g_presents && g_presents - n < 64 ? g_pres_t[n % 64] : 0; }
+ uint32_t mtl_present_qos(void) { return 0; }
+--- a/nxnative/dm/android/gfx_vk_tex.c
++++ b/nxnative/dm/android/gfx_vk_tex.c
+@@ -228,7 +228,9 @@
+ // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
+ enum { EVICT_KEEP = 60 };
+ static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
+-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
++static void img_drop(vkimg_t *im) {
++    if (vk_diag_on() && vk_present_refs(im) > 0) VKLOG("[diag] UAF RISK: image %p %ux%u dropped while still queued for present or held as last frame (present thread may blit freed memory)", (void *)im, im->w, im->h);
++    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+ static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
+     akey ks[64]; int n = 0;
+     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {

@@ -1,0 +1,6 @@
+# Written by nx2android's porter for NINJA GAIDEN Σ (0100E2F014F46000); KEY=VALUE per line, read by the app at launch
+DM_LANG=en-US
+DM_VK_NO_ZEROCOPY=1
+DM_FS=1
+DM_MOVIE=1
+DM_VK_SHOTS=5
